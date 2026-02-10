@@ -132,6 +132,7 @@ def load_existing(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+
 def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
     new_df = pd.DataFrame([new_row])
 
@@ -147,21 +148,6 @@ def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
         return existing
 
     return pd.concat([existing, new_df], ignore_index=True)
-    new_df = pd.DataFrame([new_row])
-
-    if existing.empty:
-        return new_df
-
-   compare_cols = [c for c in new_df.columns if c != "timestamp_utc"]
-    last = existing.iloc[-1][compare_cols].astype(str).to_dict()
-    now = new_df.iloc[0][compare_cols].astype(str).to_dict()
-
-    if last == now:
-        print("No metric change since last snapshot -> not appending.")
-        return existing
-
-    return pd.concat([existing, new_df], ignore_index=True)
-
 
 def main():
     print("Fetching XML export…")
