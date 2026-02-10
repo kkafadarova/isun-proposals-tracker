@@ -21,8 +21,21 @@ TARGET_PROCEDURE_NAME = os.getenv(
 OUT_CSV = os.getenv("OUT_CSV", "data/isun_bg16rfpr002-1.010_history.csv")
 
 
+# --- Bulgarian column names (final CSV headers) ---
+COL_TIMESTAMP = "timestamp_utc"
+COL_CODE = "Номер на процедура"
+COL_NAME = "Име на процедура"
+COL_SUBMITTED = "Брой подадени проектни предложения"
+COL_TOTAL = "Обща стойност на подадените проектни предложения"
+COL_BFP = "Стойност на подадените проектни предложения БФП (в евро)"
+COL_APPROVED = "Брой одобрени проектни предложения"
+COL_RESERVE = "Брой проектни предложения в резервен списък"
+COL_REJECTED = "Брой отхвърлени проектни предложения"
+
+METRIC_COLS = [COL_SUBMITTED, COL_TOTAL, COL_BFP, COL_APPROVED, COL_RESERVE, COL_REJECTED]
+
+
 def _clean(s: str) -> str:
-    # NBSP + всички whitespace -> махаме
     return re.sub(r"\s+", "", str(s).replace("\xa0", " ")).strip()
 
 
@@ -40,11 +53,11 @@ def parse_float(x):
         return None
     s = re.sub(r"[^\d\-,\.]", "", s)
 
-    # ако има само една запетая и няма точка -> приемаме запетаята за десетичен разделител
+    # "5,23" -> 5.23
     if s.count(",") == 1 and s.count(".") == 0:
         s = s.replace(",", ".")
 
-    # ако има и "," и "." -> приемаме "." за десетична, махаме "," (хилядни)
+    # "1,234.56" -> 1234.56
     if "," in s and "." in s:
         s = s.replace(",", "")
 
@@ -52,7 +65,6 @@ def parse_float(x):
 
 
 def fetch_bytes(url: str) -> bytes:
-    # Реално endpoint-ът често връща HTML; Accept оставяме широк
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; github-actions; +https://github.com)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -64,15 +76,10 @@ def fetch_bytes(url: str) -> bytes:
 
 def parse_html_tables(content_bytes: bytes) -> list[pd.DataFrame]:
     html = content_bytes.decode("utf-8", errors="replace")
-    # read_html върху literal string -> използваме StringIO
     return pd.read_html(StringIO(html))
 
 
 def parse_export_to_table(content_bytes: bytes) -> pd.DataFrame:
-    """
-    Връща DataFrame с ред(ове), които съдържат таргет процедурата.
-    Работи устойчиво при промени в header-и / различни таблици.
-    """
     tables = parse_html_tables(content_bytes)
 
     needle_code = TARGET_PROCEDURE_CODE
@@ -104,9 +111,6 @@ def parse_export_to_table(content_bytes: bytes) -> pd.DataFrame:
 
 
 def find_target_row(df: pd.DataFrame) -> pd.Series:
-    """
-    Намира първия ред, в който има TARGET_PROCEDURE_CODE или TARGET_PROCEDURE_NAME.
-    """
     needle_code = TARGET_PROCEDURE_CODE
     needle_name = TARGET_PROCEDURE_NAME
 
@@ -122,7 +126,7 @@ def find_target_row(df: pd.DataFrame) -> pd.Series:
     hits = df.loc[mask]
     if hits.empty:
         raise RuntimeError(
-            "Не намерих таргет ред (търсене във всички клетки).\n"
+            "Не намерих таргет ред.\n"
             f"Колони: {list(df.columns)}\n"
             f"Търсих: {needle_code} / {needle_name}"
         )
@@ -132,9 +136,9 @@ def find_target_row(df: pd.DataFrame) -> pd.Series:
 
 def extract_metrics_from_row(row: pd.Series) -> dict:
     """
-    Извлича 6-те стойности от реда без да разчита на имена на колони.
-    Очакван ред в таблицата:
-      код | име | submitted | total_value | bfp_value | approved | reserve | rejected
+    Очакван ред:
+      код | име | submitted | total | bfp | approved | reserve | rejected
+    Извличаме 6-те метрики устойчиво, без да разчитаме на header-и.
     """
     cells = ["" if pd.isna(v) else str(v) for v in row.tolist()]
 
@@ -145,50 +149,49 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
             break
 
     if code_idx is None:
-        raise RuntimeError("Не намерих кода в таргет реда, за да извлека числата.")
+        raise RuntimeError("Не намерих кода в таргет реда.")
 
-    after = cells[code_idx + 1 :]
-    scan = after[:25]  # буфер за всеки случай
+    scan = cells[code_idx + 1 : code_idx + 1 + 25]
 
-    numeric = []
+    numeric_tokens = []
     for v in scan:
         vv = v.strip()
-        # ако има цифра, пробваме да стане число
         if re.search(r"\d", vv):
             f = parse_float(vv)
             if f is not None:
-                numeric.append(vv)
-        if len(numeric) >= 6:
+                numeric_tokens.append(vv)
+        if len(numeric_tokens) >= 6:
             break
 
-    if len(numeric) < 6:
-        raise RuntimeError(
-            f"Не успях да извлека 6 числови клетки от реда. Намерих {len(numeric)}: {numeric}"
-        )
+    if len(numeric_tokens) < 6:
+        raise RuntimeError(f"Не успях да извлека 6 числови клетки. Намерих: {numeric_tokens}")
+
+    submitted = parse_int(numeric_tokens[0])
+    total_val = parse_float(numeric_tokens[1])
+    bfp_val = parse_float(numeric_tokens[2])
+    approved = parse_int(numeric_tokens[3])
+    reserve = parse_int(numeric_tokens[4])
+    rejected = parse_int(numeric_tokens[5])
 
     return {
-        "submitted_count": parse_int(numeric[0]),
-        "total_value_eur": parse_float(numeric[1]),
-        "bfp_value_eur": parse_float(numeric[2]),
-        "approved_count": parse_int(numeric[3]),
-        "reserve_count": parse_int(numeric[4]),
-        "rejected_count": parse_int(numeric[5]),
+        COL_SUBMITTED: int(submitted) if submitted is not None else None,
+        COL_TOTAL: float(total_val) if total_val is not None else None,
+        COL_BFP: float(bfp_val) if bfp_val is not None else None,
+        COL_APPROVED: int(approved) if approved is not None else None,
+        COL_RESERVE: int(reserve) if reserve is not None else None,
+        COL_REJECTED: int(rejected) if rejected is not None else None,
     }
 
 
-def normalize_row(row: pd.Series) -> dict:
+def make_snapshot(row: pd.Series) -> dict:
     ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-    # код/име ги държим стабилни
-    procedure_code = TARGET_PROCEDURE_CODE
-    procedure_name = TARGET_PROCEDURE_NAME
 
     metrics = extract_metrics_from_row(row)
 
     return {
-        "timestamp_utc": ts,
-        "procedure_code": procedure_code,
-        "procedure_name": procedure_name,
+        COL_TIMESTAMP: ts,
+        COL_CODE: TARGET_PROCEDURE_CODE,
+        COL_NAME: TARGET_PROCEDURE_NAME,
         **metrics,
     }
 
@@ -199,25 +202,41 @@ def load_existing(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def _num_equal(a, b) -> bool:
+    """
+    Сравнява числа robust:
+    - None/NaN се считат равни помежду си
+    - int/float се сравняват като float с толеранс за float полетата
+    """
+    if pd.isna(a) and pd.isna(b):
+        return True
+
+    # ints may come as strings sometimes
+    try:
+        fa = float(a)
+        fb = float(b)
+    except Exception:
+        return str(a) == str(b)
+
+    return abs(fa - fb) < 1e-6
+
+
 def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
     new_df = pd.DataFrame([new_row])
 
     if existing is None or existing.empty:
         return new_df
 
-    compare_cols = [c for c in new_df.columns if c != "timestamp_utc"]
-
     last = existing.iloc[-1]
-    changed = False
-    for c in compare_cols:
-        if str(last.get(c, "")) != str(new_row.get(c, "")):
-            changed = True
-            break
 
-    if not changed:
-        return existing
+    for c in METRIC_COLS:
+        if c not in existing.columns:
+            return pd.concat([existing, new_df], ignore_index=True)
 
-    return pd.concat([existing, new_df], ignore_index=True)
+        if not _num_equal(last[c], new_row.get(c)):
+            return pd.concat([existing, new_df], ignore_index=True)
+
+    return existing
 
 
 def main():
@@ -230,7 +249,7 @@ def main():
     print("Finding target procedure row…")
     row = find_target_row(table)
 
-    snapshot = normalize_row(row)
+    snapshot = make_snapshot(row)
     print("Snapshot:", snapshot)
 
     os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
