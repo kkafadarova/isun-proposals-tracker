@@ -28,15 +28,31 @@ def fetch_xml(url: str) -> bytes:
     return r.content
 
 
-def parse_xml_to_table(xml_bytes: bytes) -> pd.DataFrame:
-    """
-    Чете XML export-а като таблица.
-    XML-ът е “табличен” и pandas може да го хване като dataframe през read_xml.
-    """
-    df = pd.read_xml(xml_bytes)
+import pandas as pd
 
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+def parse_xml_to_table(content_bytes: bytes) -> pd.DataFrame:
+    """
+    Despite the name, this now parses the ExportToHtml output (HTML tables).
+    We keep the function name to minimize changes elsewhere.
+    """
+    html = content_bytes.decode("utf-8", errors="replace")
+
+    # Quick guard: if for some reason we got an error page without tables
+    if "<table" not in html.lower():
+        raise RuntimeError("Expected HTML with <table>, got something else (possibly blocked).")
+
+    # Read all tables from HTML
+    tables = pd.read_html(html)
+
+    # We want the table with the per-procedure rows.
+    # In the page, there is usually a 'Общо' table and then 'Проектни предложения' table.
+    # The second one typically contains 'Номер на процедура' column.
+    for t in tables:
+        cols = [str(c).strip() for c in t.columns]
+        if "Номер на процедура" in cols:
+            return t
+
+    raise RuntimeError("Could not find the 'Номер на процедура' table in HTML export.")
 
 
 def find_target_row(df: pd.DataFrame) -> pd.Series:
