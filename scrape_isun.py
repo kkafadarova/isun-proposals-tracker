@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import requests
 
+
 EXPORT_XML_URL = os.getenv(
     "EXPORT_XML_URL",
     "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToXml?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True"
@@ -132,6 +133,20 @@ def load_existing(path: str) -> pd.DataFrame:
 
 
 def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
+    new_df = pd.DataFrame([new_row])
+
+    if existing.empty:
+        return new_df
+
+    compare_cols = [c for c in new_df.columns if c != "timestamp_utc"]
+
+    last_row = existing.iloc[-1][compare_cols]
+    current_row = new_df.iloc[0][compare_cols]
+
+    if last_row.equals(current_row):
+        return existing
+
+    return pd.concat([existing, new_df], ignore_index=True)
     new_df = pd.DataFrame([new_row])
 
     if existing.empty:
