@@ -28,71 +28,72 @@ def fetch_xml(url: str) -> bytes:
     return r.content
 
 
-import pandas as pd
+from io import StringIO
 
 def parse_xml_to_table(content_bytes: bytes) -> pd.DataFrame:
     """
-    Despite the name, this now parses the ExportToHtml output (HTML tables).
-    We keep the function name to minimize changes elsewhere.
+    Parses ExportToHtml output and returns ONLY the rows that contain
+    the target procedure code/name (robust vs. header changes).
     """
     html = content_bytes.decode("utf-8", errors="replace")
 
-    # Quick guard: if for some reason we got an error page without tables
-    if "<table" not in html.lower():
-        raise RuntimeError("Expected HTML with <table>, got something else (possibly blocked).")
+    tables = pd.read_html(StringIO(html))
 
-    # Read all tables from HTML
-    tables = pd.read_html(html)
+    needle_code = TARGET_PROCEDURE_CODE
+    needle_name = TARGET_PROCEDURE_NAME
 
-    # We want the table with the per-procedure rows.
-    # In the page, there is usually a 'Общо' table and then 'Проектни предложения' table.
-    # The second one typically contains 'Номер на процедура' column.
+    hits = []
     for t in tables:
-        cols = [str(c).strip() for c in t.columns]
-        if "Номер на процедура" in cols:
-            return t
+        tt = t.copy()
+        tt.columns = [str(c).strip() for c in tt.columns]
+        tt = tt.applymap(lambda x: "" if pd.isna(x) else str(x))
 
-    raise RuntimeError("Could not find the 'Номер на процедура' table in HTML export.")
+        mask = tt.apply(
+            lambda row: any(needle_code in cell or needle_name in cell for cell in row),
+            axis=1
+        )
+
+        if mask.any():
+            hits.append(t[mask])
+
+    if not hits:
+        debug_cols = [list(map(str, t.columns)) for t in tables[:5]]
+        raise RuntimeError(
+            "Не намерих ред с таргет процедурата в HTML таблиците.\n"
+            f"Търсих: {needle_code} / {needle_name}\n"
+            f"Първите 5 таблици колони: {debug_cols}"
+        )
+
+    return pd.concat(hits, ignore_index=True)
 
 
 def find_target_row(df: pd.DataFrame) -> pd.Series:
-    code_cols = [c for c in df.columns if "процед" in c.lower() and "номер" in c.lower()] + \
-               [c for c in df.columns if "procedure" in c.lower() and "number" in c.lower()] + \
-               [c for c in df.columns if "Procedure" in c]
+    """
+    Robust: does not rely on specific column names.
+    Finds the first row where ANY cell contains the target code or name.
+    """
+    needle_code = TARGET_PROCEDURE_CODE
+    needle_name = TARGET_PROCEDURE_NAME
 
-    name_cols = [c for c in df.columns if "име" in c.lower()] + \
-               [c for c in df.columns if "name" in c.lower()]
+    # Normalize to strings (safe search)
+    df_str = df.copy()
+    df_str.columns = [str(c).strip() for c in df_str.columns]
+    df_str = df_str.applymap(lambda x: "" if pd.isna(x) else str(x))
 
-    preferred_code = None
-    for cand in ["Номер на процедура", "ProcedureNumber", "Procedure", "ProcedureCode"]:
-        if cand in df.columns:
-            preferred_code = cand
-            break
-
-    preferred_name = None
-    for cand in ["Име на процедура", "ProcedureName", "Name"]:
-        if cand in df.columns:
-            preferred_name = cand
-            break
-
-    code_col = preferred_code or (code_cols[0] if code_cols else None)
-    name_col = preferred_name or (name_cols[0] if name_cols else None)
-
-    if code_col:
-        hit = df[df[code_col].astype(str).str.strip() == TARGET_PROCEDURE_CODE]
-        if len(hit) == 1:
-            return hit.iloc[0]
-
-    if name_col:
-        hit = df[df[name_col].astype(str).str.contains(TARGET_PROCEDURE_NAME, regex=False)]
-        if len(hit) == 1:
-            return hit.iloc[0]
-
-    raise RuntimeError(
-        "Не намерих таргет ред в XML.\n"
-        f"Колони: {list(df.columns)}\n"
-        f"Търсих code={TARGET_PROCEDURE_CODE} и name contains '{TARGET_PROCEDURE_NAME}'."
+    mask = df_str.apply(
+        lambda row: any((needle_code in cell) or (needle_name in cell) for cell in row),
+        axis=1
     )
+
+    hits = df.loc[mask]
+    if hits.empty:
+        raise RuntimeError(
+            "Не намерих таргет ред (търсене във всички клетки).\n"
+            f"Колони: {list(df.columns)}\n"
+            f"Търсих: {needle_code} / {needle_name}"
+        )
+
+    return hits.iloc[0]
 
 
 def normalize_metrics(row: pd.Series) -> dict:
