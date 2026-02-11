@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright browser
+      - name: Install Playwright browsers
         run: |
           python -m playwright install --with-deps chromium
 
@@ -43,7 +43,8 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git add data/isun_bg16rfpr002-1.010_history.csv debug/*.html || true
+          git add data/isun_bg16rfpr002-1.010_history.csv || true
+          git add debug/last_playwright.html debug/last_response_requests.html || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
