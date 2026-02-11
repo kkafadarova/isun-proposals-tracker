@@ -11,7 +11,8 @@ import requests
 
 EXPORT_URL = os.getenv(
     "EXPORT_URL",
-    "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToHtml?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True",
+    "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToHtml"
+    "?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True",
 )
 
 TARGET_PROCEDURE_CODE = os.getenv("TARGET_PROCEDURE_CODE", "BG16RFPR002-1.010")
@@ -22,8 +23,11 @@ TARGET_PROCEDURE_NAME = os.getenv(
 
 OUT_CSV = os.getenv("OUT_CSV", "data/isun_bg16rfpr002-1.010_history.csv")
 
+DEBUG_DIR = Path(os.getenv("DEBUG_DIR", "debug"))
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Final CSV headers (Bulgarian) ---
+
+# --- Final CSV column names (Bulgarian headers) ---
 COL_TIMESTAMP = "timestamp_utc"
 COL_CODE = "Номер на процедура"
 COL_NAME = "Име на процедура"
@@ -37,170 +41,154 @@ COL_REJECTED = "Брой отхвърлени проектни предложе�
 METRIC_COLS = [COL_SUBMITTED, COL_TOTAL, COL_BFP, COL_APPROVED, COL_RESERVE, COL_REJECTED]
 
 
-def _clean_spaces(s: str) -> str:
-    return str(s).replace("\xa0", " ").strip()
+ANTI_BOT_MARKERS = [
+    "/TSPD/",
+    "APM_DO_NOT_TOUCH",
+    "TSPD/08997",
+    "window.gzwW",
+    "distil_r_captcha",  # sometimes
+]
 
 
-def _clean_numeric(s: str) -> str:
-    # remove spaces incl. non-breaking
-    return re.sub(r"\s+", "", _clean_spaces(s))
+def is_protected_page(html: str) -> bool:
+    h = html or ""
+    return any(m in h for m in ANTI_BOT_MARKERS)
+
+
+def _clean(s: str) -> str:
+    # normalize whitespace + non-breaking spaces
+    return re.sub(r"\s+", " ", str(s).replace("\xa0", " ")).strip()
 
 
 def parse_int(x):
-    s = _clean_numeric(x)
-    if not s:
+    s = _clean(x)
+    if s == "":
         return None
     s = re.sub(r"[^\d-]", "", s)
     return int(s) if s else None
 
 
 def parse_float(x):
-    s = _clean_numeric(x)
-    if not s:
+    s = _clean(x)
+    if s == "":
         return None
 
-    # keep only digits/sign/dot/comma
+    # keep digits, comma, dot, minus
     s = re.sub(r"[^\d\-,\.]", "", s)
 
-    # "5,23" -> 5.23
+    # "5,23" -> "5.23"
     if s.count(",") == 1 and s.count(".") == 0:
         s = s.replace(",", ".")
 
-    # "1,234.56" -> 1234.56  (remove thousands commas)
+    # "1,234.56" -> "1234.56"
     if "," in s and "." in s:
         s = s.replace(",", "")
 
     return float(s) if s else None
 
 
-def is_antibot_page(html_text: str) -> bool:
-    t = html_text.lower()
-    markers = [
-        "request rejected",
-        "tspd",
-        "apm_do_not_touch",
-        "please wait",
-        "моля, изчакайте",
-        "access denied",
-        "forbidden",
-    ]
-    return any(m in t for m in markers)
-
-
-def fetch_bytes_with_retries(url: str, attempts: int = 6, timeout: int = 60) -> bytes:
-    session = requests.Session()
-
-    headers_common = {
+def fetch_with_requests(url: str, timeout: int = 60) -> bytes:
+    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0.0.0 Safari/537.36"
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
+        "Accept-Language": "bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
+    r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r.content
 
-    debug_dir = Path("debug")
-    debug_dir.mkdir(parents=True, exist_ok=True)
 
-    last_exc = None
+def fetch_with_playwright(url: str, timeout_ms: int = 60_000) -> bytes:
+    """
+    Headless browser fallback to bypass JS anti-bot pages.
+    Requires: playwright + chromium installed in CI.
+    """
+    from playwright.sync_api import sync_playwright  # lazy import
 
-    for i in range(1, attempts + 1):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="bg-BG",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+        # some anti-bot scripts set cookies after a short delay
+        page.wait_for_timeout(3000)
+
+        # wait for at least one table to exist (best effort)
         try:
-            # 1) warm-up (cookies)
-            base = "https://2020.eufunds.bg/"
-            session.get(base, headers=headers_common, timeout=timeout, allow_redirects=True)
+            page.wait_for_selector("table", timeout=10_000)
+        except Exception:
+            pass
 
-            # 2) fetch export
-            r = session.get(url, headers=headers_common, timeout=timeout, allow_redirects=True)
-            r.raise_for_status()
+        html = page.content()
+        browser.close()
+        return html.encode("utf-8", errors="replace")
 
-            html = r.content.decode("utf-8", errors="replace")
-            if is_antibot_page(html):
-                (debug_dir / "last_response.html").write_text(html, encoding="utf-8")
-                raise RuntimeError("ISUN returned a protected/anti-bot page")
 
-            return r.content
+def fetch_export(url: str) -> bytes:
+    # 1) try requests
+    content = fetch_with_requests(url)
+    html = content.decode("utf-8", errors="replace")
 
-        except Exception as e:
-            last_exc = e
-            # backoff: 3, 6, 9, 12...
-            sleep_s = 3 * i
-            print(f"[fetch attempt {i}/{attempts}] failed: {e} -> sleeping {sleep_s}s")
-            time.sleep(sleep_s)
+    if is_protected_page(html):
+        (DEBUG_DIR / "last_response_requests.html").write_text(html, encoding="utf-8")
+        print("Protected page detected (requests). Falling back to Playwright…")
+        content = fetch_with_playwright(url)
+        html2 = content.decode("utf-8", errors="replace")
+        (DEBUG_DIR / "last_response_playwright.html").write_text(html2, encoding="utf-8")
 
-    raise RuntimeError(
-        f"Failed to fetch ISUN export after {attempts} attempts. Last error: {last_exc}"
-    )
+        if is_protected_page(html2):
+            raise RuntimeError(
+                "ISUN returned a protected/anti-bot page even via Playwright. "
+                "See debug/last_response_playwright.html"
+            )
+        return content
+
+    return content
 
 
 def parse_html_tables(content_bytes: bytes) -> list[pd.DataFrame]:
     html = content_bytes.decode("utf-8", errors="replace")
-    # IMPORTANT: use lxml flavor -> no html5lib dependency
-    return pd.read_html(StringIO(html), flavor="lxml")
+    if is_protected_page(html):
+        raise RuntimeError("Protected/anti-bot HTML (cannot parse tables).")
+    # pandas needs html5lib/lxml
+    return pd.read_html(StringIO(html))
 
 
-def parse_export_to_table(content_bytes: bytes) -> pd.DataFrame:
-    tables = parse_html_tables(content_bytes)
-
+def find_row_in_tables(tables: list[pd.DataFrame]) -> pd.Series:
     needle_code = TARGET_PROCEDURE_CODE
     needle_name = TARGET_PROCEDURE_NAME
 
-    hits = []
     for t in tables:
-        tt = t.copy()
-        tt.columns = [str(c).strip() for c in tt.columns]
-        tt = tt.fillna("").astype(str)
-
+        tt = t.fillna("").astype(str)
         mask = tt.apply(
             lambda row: any((needle_code in cell) or (needle_name in cell) for cell in row),
             axis=1,
         )
-
         if mask.any():
-            hits.append(t[mask])
+            return t.loc[mask].iloc[0]
 
-    if not hits:
-        debug_cols = [list(map(str, t.columns)) for t in tables[:6]]
-        raise RuntimeError(
-            "Не намерих ред с таргет процедурата в HTML таблиците.\n"
-            f"Търсих: {needle_code} / {needle_name}\n"
-            f"Първите 6 таблици колони: {debug_cols}"
-        )
-
-    return pd.concat(hits, ignore_index=True)
-
-
-def find_target_row(df: pd.DataFrame) -> pd.Series:
-    needle_code = TARGET_PROCEDURE_CODE
-    needle_name = TARGET_PROCEDURE_NAME
-
-    df_str = df.copy()
-    df_str.columns = [str(c).strip() for c in df_str.columns]
-    df_str = df_str.fillna("").astype(str)
-
-    mask = df_str.apply(
-        lambda row: any((needle_code in cell) or (needle_name in cell) for cell in row),
-        axis=1,
-    )
-
-    hits = df.loc[mask]
-    if hits.empty:
-        raise RuntimeError(
-            "Не намерих таргет ред.\n"
-            f"Колони: {list(df.columns)}\n"
-            f"Търсих: {needle_code} / {needle_name}"
-        )
-
-    return hits.iloc[0]
+    raise RuntimeError("Target procedure row not found in any parsed table.")
 
 
 def extract_metrics_from_row(row: pd.Series) -> dict:
     """
-    Expected row contains:
+    The export row contains:
       code | name | submitted | total | bfp | approved | reserve | rejected
-    We'll scan the cells after the code and pick first 6 numeric tokens.
+    But headers may vary, so we scan after the code cell and take the next 6 numeric cells.
     """
     cells = ["" if pd.isna(v) else str(v) for v in row.tolist()]
 
@@ -209,15 +197,15 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
         if TARGET_PROCEDURE_CODE in v:
             code_idx = i
             break
-    if code_idx is None:
-        raise RuntimeError("Не намерих кода в таргет реда.")
 
-    # scan a window after code
+    if code_idx is None:
+        raise RuntimeError("Could not locate procedure code inside the target row.")
+
     scan = cells[code_idx + 1 : code_idx + 1 + 30]
 
     numeric_tokens = []
     for v in scan:
-        vv = _clean_spaces(v)
+        vv = _clean(v)
         if re.search(r"\d", vv):
             f = parse_float(vv)
             if f is not None:
@@ -226,9 +214,7 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
             break
 
     if len(numeric_tokens) < 6:
-        raise RuntimeError(
-            f"Не успях да извлека 6 числови клетки. Намерих ({len(numeric_tokens)}): {numeric_tokens}"
-        )
+        raise RuntimeError(f"Could not extract 6 numeric cells. Got: {numeric_tokens}")
 
     submitted = parse_int(numeric_tokens[0])
     total_val = parse_float(numeric_tokens[1])
@@ -261,15 +247,16 @@ def make_snapshot(row: pd.Series) -> dict:
 
 def load_existing(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[COL_TIMESTAMP, COL_CODE, COL_NAME, *METRIC_COLS])
     return pd.read_csv(path)
 
 
 def _num_equal(a, b) -> bool:
-    # treat empty as equal
-    if (pd.isna(a) or a == "") and (pd.isna(b) or b == ""):
+    # treat None/NaN as equal
+    if (a is None or (isinstance(a, float) and pd.isna(a))) and (b is None or (isinstance(b, float) and pd.isna(b))):
         return True
-
+    if pd.isna(a) and pd.isna(b):
+        return True
     try:
         fa = float(a)
         fb = float(b)
@@ -279,19 +266,23 @@ def _num_equal(a, b) -> bool:
 
 
 def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
+    """
+    Requirement:
+    1) DO NOT append if the last row has the same metric values.
+    """
     new_df = pd.DataFrame([new_row])
 
     if existing is None or existing.empty:
         return new_df
 
-    # if columns missing (schema drift) -> append
+    last = existing.iloc[-1]
+
+    # if columns differ, be safe and append
     for c in METRIC_COLS:
         if c not in existing.columns:
             return pd.concat([existing, new_df], ignore_index=True)
 
-    last = existing.iloc[-1]
-
-    # only compare the 6 metrics (NOT timestamp)
+    # compare ONLY metric cols (not timestamp)
     changed = any(not _num_equal(last[c], new_row.get(c)) for c in METRIC_COLS)
     if not changed:
         return existing
@@ -301,13 +292,15 @@ def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
 
 def main():
     print("Fetching export…")
-    content = fetch_bytes_with_retries(EXPORT_URL)
+    content = fetch_export(EXPORT_URL)
 
     print("Parsing tables…")
-    table = parse_export_to_table(content)
+    tables = parse_html_tables(content)
+    if not tables:
+        raise RuntimeError("No tables found after fetch (unexpected).")
 
     print("Finding target procedure row…")
-    row = find_target_row(table)
+    row = find_row_in_tables(tables)
 
     snapshot = make_snapshot(row)
     print("Snapshot:", snapshot)

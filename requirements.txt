@@ -1,5 +1,5 @@
-pandas
-requests
-lxml
-html5lib
-beautifulsoup4
+pandas>=2.2.0
+lxml>=5.0.0
+html5lib>=1.1
+requests>=2.31.0
+playwright>=1.41.0
