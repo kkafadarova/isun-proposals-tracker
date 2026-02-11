@@ -125,35 +125,37 @@ def fetch_with_debug(url: str) -> bytes:
     return content
 
 
+from io import BytesIO, StringIO
+import pandas as pd
+
 def read_table_from_export(content: bytes) -> pd.DataFrame:
     """
-    Prefer reading Excel bytes; if not excel, try HTML.
+    ISUN export sometimes returns:
+      - Excel (.xlsx) => bytes start with b'PK\\x03\\x04'
+      - HTML page => text with <html> and <table>
+    This function detects and parses accordingly.
     """
-    # Try Excel
-    try:
-        df = pd.read_excel(BytesIO(content), engine="openpyxl")
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-    except Exception:
-        pass
+    # 1) Excel (xlsx) signature
+    if content[:4] == b"PK\x03\x04":
+        xls = pd.read_excel(BytesIO(content))
+        return xls
 
-    # Try HTML (fallback)
-    try:
-        html = content.decode("utf-8", errors="replace")
-        tables = pd.read_html(html)
-        # Choose the table most likely to contain procedure rows (has the code column or many cols)
-        if not tables:
-            raise ValueError("No tables found")
-        # pick the widest table
-        tables_sorted = sorted(tables, key=lambda t: (t.shape[1], t.shape[0]), reverse=True)
-        return tables_sorted[0]
-    except Exception as e:
-        _ensure_dir("debug/last_non_excel_response.html")
-        with open("debug/last_non_excel_response.html", "wb") as f:
-            f.write(content)
-        raise RuntimeError(
-            f"Could not parse export as Excel or HTML tables. Saved debug/last_non_excel_response.html. ({e})"
-        )
+    # 2) Otherwise treat as HTML
+    html = content.decode("utf-8", errors="replace")
+
+    # quick sanity check
+    if "<table" not in html.lower():
+        # save for debugging
+        os.makedirs("debug", exist_ok=True)
+        with open("debug/last_non_table_response.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        raise RuntimeError("HTML response has no <table>. Saved debug/last_non_table_response.html")
+
+    tables = pd.read_html(StringIO(html))
+    if not tables:
+        raise RuntimeError("No tables found in HTML by pandas.")
+    # return all tables concatenated OR pick the relevant one later
+    return pd.concat(tables, ignore_index=True)
 
 
 def find_target_row(df: pd.DataFrame) -> pd.Series:
