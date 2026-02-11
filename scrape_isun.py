@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -8,11 +9,9 @@ import pandas as pd
 import requests
 
 
-# ---- Config ----
 EXPORT_URL = os.getenv(
     "EXPORT_URL",
-    "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToHtml"
-    "?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True",
+    "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToHtml?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True",
 )
 
 TARGET_PROCEDURE_CODE = os.getenv("TARGET_PROCEDURE_CODE", "BG16RFPR002-1.010")
@@ -23,11 +22,8 @@ TARGET_PROCEDURE_NAME = os.getenv(
 
 OUT_CSV = os.getenv("OUT_CSV", "data/isun_bg16rfpr002-1.010_history.csv")
 
-DEBUG_DIR = Path(os.getenv("DEBUG_DIR", "debug"))
-DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# --- Bulgarian column names (final CSV headers) ---
+# --- Final CSV headers (Bulgarian) ---
 COL_TIMESTAMP = "timestamp_utc"
 COL_CODE = "Номер на процедура"
 COL_NAME = "Име на процедура"
@@ -41,90 +37,117 @@ COL_REJECTED = "Брой отхвърлени проектни предложе�
 METRIC_COLS = [COL_SUBMITTED, COL_TOTAL, COL_BFP, COL_APPROVED, COL_RESERVE, COL_REJECTED]
 
 
-# ---- Helpers ----
-def _clean(s: str) -> str:
-    # keep numbers readable for parsing
+def _clean_spaces(s: str) -> str:
     return str(s).replace("\xa0", " ").strip()
 
 
+def _clean_numeric(s: str) -> str:
+    # remove spaces incl. non-breaking
+    return re.sub(r"\s+", "", _clean_spaces(s))
+
+
 def parse_int(x):
-    s = _clean(x)
-    if s == "" or s.lower() == "nan":
+    s = _clean_numeric(x)
+    if not s:
         return None
     s = re.sub(r"[^\d-]", "", s)
     return int(s) if s else None
 
 
 def parse_float(x):
-    s = _clean(x)
-    if s == "" or s.lower() == "nan":
+    s = _clean_numeric(x)
+    if not s:
         return None
 
-    # leave digits + separators only
+    # keep only digits/sign/dot/comma
     s = re.sub(r"[^\d\-,\.]", "", s)
 
-    # "5,23" -> "5.23"
+    # "5,23" -> 5.23
     if s.count(",") == 1 and s.count(".") == 0:
         s = s.replace(",", ".")
 
-    # "1,234.56" -> "1234.56"
+    # "1,234.56" -> 1234.56  (remove thousands commas)
     if "," in s and "." in s:
         s = s.replace(",", "")
 
     return float(s) if s else None
 
 
-def fetch_bytes(url: str) -> bytes:
-    headers = {
+def is_antibot_page(html_text: str) -> bool:
+    t = html_text.lower()
+    markers = [
+        "request rejected",
+        "tspd",
+        "apm_do_not_touch",
+        "please wait",
+        "моля, изчакайте",
+        "access denied",
+        "forbidden",
+    ]
+    return any(m in t for m in markers)
+
+
+def fetch_bytes_with_retries(url: str, attempts: int = 6, timeout: int = 60) -> bytes:
+    session = requests.Session()
+
+    headers_common = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/121.0.0.0 Safari/537.36"
+            "Chrome/122.0.0.0 Safari/537.36"
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
         "Connection": "keep-alive",
     }
-    r = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
-    r.raise_for_status()
 
-    content = r.content
+    debug_dir = Path("debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
 
-    # quick “blocked / protected” detection
-    head = content[:8000].decode("utf-8", errors="ignore").lower()
-    if any(k in head for k in ["apm_do_not_touch", "tspd", "captcha", "please wait"]):
-        # save for inspection
-        (DEBUG_DIR / "last_response.html").write_bytes(content)
-        raise RuntimeError(
-            "ISUN returned a protected/anti-bot page (saved to debug/last_response.html)."
-        )
+    last_exc = None
 
-    return content
+    for i in range(1, attempts + 1):
+        try:
+            # 1) warm-up (cookies)
+            base = "https://2020.eufunds.bg/"
+            session.get(base, headers=headers_common, timeout=timeout, allow_redirects=True)
+
+            # 2) fetch export
+            r = session.get(url, headers=headers_common, timeout=timeout, allow_redirects=True)
+            r.raise_for_status()
+
+            html = r.content.decode("utf-8", errors="replace")
+            if is_antibot_page(html):
+                (debug_dir / "last_response.html").write_text(html, encoding="utf-8")
+                raise RuntimeError("ISUN returned a protected/anti-bot page")
+
+            return r.content
+
+        except Exception as e:
+            last_exc = e
+            # backoff: 3, 6, 9, 12...
+            sleep_s = 3 * i
+            print(f"[fetch attempt {i}/{attempts}] failed: {e} -> sleeping {sleep_s}s")
+            time.sleep(sleep_s)
+
+    raise RuntimeError(
+        f"Failed to fetch ISUN export after {attempts} attempts. Last error: {last_exc}"
+    )
 
 
 def parse_html_tables(content_bytes: bytes) -> list[pd.DataFrame]:
     html = content_bytes.decode("utf-8", errors="replace")
-
-    try:
-        # IMPORTANT: force lxml (stable in CI)
-        return pd.read_html(StringIO(html), flavor="lxml")
-    except ValueError:
-        # No tables found -> dump response to debug
-        (DEBUG_DIR / "last_response.html").write_text(html, encoding="utf-8")
-        raise RuntimeError(
-            "No HTML tables found in export response. "
-            "Saved debug/last_response.html (likely not the expected export page)."
-        )
+    # IMPORTANT: use lxml flavor -> no html5lib dependency
+    return pd.read_html(StringIO(html), flavor="lxml")
 
 
-def find_procedure_table(tables: list[pd.DataFrame]) -> pd.DataFrame:
-    """
-    Find the table that contains rows with procedure code/name.
-    We don't rely on headers (they may change).
-    """
+def parse_export_to_table(content_bytes: bytes) -> pd.DataFrame:
+    tables = parse_html_tables(content_bytes)
+
     needle_code = TARGET_PROCEDURE_CODE
     needle_name = TARGET_PROCEDURE_NAME
 
+    hits = []
     for t in tables:
         tt = t.copy()
         tt.columns = [str(c).strip() for c in tt.columns]
@@ -136,75 +159,85 @@ def find_procedure_table(tables: list[pd.DataFrame]) -> pd.DataFrame:
         )
 
         if mask.any():
-            # return only matching rows
-            return t.loc[mask].reset_index(drop=True)
+            hits.append(t[mask])
 
-    # debug: write column sets
-    cols_preview = [list(map(str, t.columns)) for t in tables[:10]]
-    raise RuntimeError(
-        "Could not find any table containing the target procedure.\n"
-        f"Looked for: {needle_code} / {needle_name}\n"
-        f"First tables columns preview: {cols_preview}"
-    )
+    if not hits:
+        debug_cols = [list(map(str, t.columns)) for t in tables[:6]]
+        raise RuntimeError(
+            "Не намерих ред с таргет процедурата в HTML таблиците.\n"
+            f"Търсих: {needle_code} / {needle_name}\n"
+            f"Първите 6 таблици колони: {debug_cols}"
+        )
+
+    return pd.concat(hits, ignore_index=True)
 
 
 def find_target_row(df: pd.DataFrame) -> pd.Series:
-    """
-    Pick the best row: exact code match if possible, else name contains.
-    """
-    df_str = df.fillna("").astype(str)
+    needle_code = TARGET_PROCEDURE_CODE
+    needle_name = TARGET_PROCEDURE_NAME
 
-    # exact code match anywhere in row
-    mask_code = df_str.apply(lambda r: any(TARGET_PROCEDURE_CODE == c.strip() for c in r), axis=1)
-    hits = df.loc[mask_code]
-    if not hits.empty:
-        return hits.iloc[0]
+    df_str = df.copy()
+    df_str.columns = [str(c).strip() for c in df_str.columns]
+    df_str = df_str.fillna("").astype(str)
 
-    # name contains anywhere in row
-    mask_name = df_str.apply(lambda r: any(TARGET_PROCEDURE_NAME in c for c in r), axis=1)
-    hits = df.loc[mask_name]
-    if not hits.empty:
-        return hits.iloc[0]
+    mask = df_str.apply(
+        lambda row: any((needle_code in cell) or (needle_name in cell) for cell in row),
+        axis=1,
+    )
 
-    raise RuntimeError("Target row not found after table was already filtered (unexpected).")
+    hits = df.loc[mask]
+    if hits.empty:
+        raise RuntimeError(
+            "Не намерих таргет ред.\n"
+            f"Колони: {list(df.columns)}\n"
+            f"Търсих: {needle_code} / {needle_name}"
+        )
+
+    return hits.iloc[0]
 
 
 def extract_metrics_from_row(row: pd.Series) -> dict:
     """
-    Expected row format in HTML export table:
-      [code] [name] [submitted] [total] [bfp] [approved] [reserve] [rejected]
-
-    We find code position then take the NEXT 7 cells:
-      name + 6 metrics
-    This is more stable than scanning 'any digits' (because the name can contain digits).
+    Expected row contains:
+      code | name | submitted | total | bfp | approved | reserve | rejected
+    We'll scan the cells after the code and pick first 6 numeric tokens.
     """
-    cells = ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
+    cells = ["" if pd.isna(v) else str(v) for v in row.tolist()]
 
     code_idx = None
     for i, v in enumerate(cells):
-        if v.strip() == TARGET_PROCEDURE_CODE or TARGET_PROCEDURE_CODE in v:
+        if TARGET_PROCEDURE_CODE in v:
             code_idx = i
             break
     if code_idx is None:
-        raise RuntimeError("Could not locate procedure code in row.")
+        raise RuntimeError("Не намерих кода в таргет реда.")
 
-    # take: name + 6 metric cells
-    tail = cells[code_idx + 1 : code_idx + 1 + 7]
-    if len(tail) < 7:
-        raise RuntimeError(f"Row too short after code. Got {len(tail)} cells: {tail}")
+    # scan a window after code
+    scan = cells[code_idx + 1 : code_idx + 1 + 30]
 
-    name_cell = tail[0]
-    m1, m2, m3, m4, m5, m6 = tail[1:7]
+    numeric_tokens = []
+    for v in scan:
+        vv = _clean_spaces(v)
+        if re.search(r"\d", vv):
+            f = parse_float(vv)
+            if f is not None:
+                numeric_tokens.append(vv)
+        if len(numeric_tokens) >= 6:
+            break
 
-    submitted = parse_int(m1)
-    total_val = parse_float(m2)
-    bfp_val = parse_float(m3)
-    approved = parse_int(m4)
-    reserve = parse_int(m5)
-    rejected = parse_int(m6)
+    if len(numeric_tokens) < 6:
+        raise RuntimeError(
+            f"Не успях да извлека 6 числови клетки. Намерих ({len(numeric_tokens)}): {numeric_tokens}"
+        )
+
+    submitted = parse_int(numeric_tokens[0])
+    total_val = parse_float(numeric_tokens[1])
+    bfp_val = parse_float(numeric_tokens[2])
+    approved = parse_int(numeric_tokens[3])
+    reserve = parse_int(numeric_tokens[4])
+    rejected = parse_int(numeric_tokens[5])
 
     return {
-        COL_NAME: name_cell if name_cell else TARGET_PROCEDURE_NAME,
         COL_SUBMITTED: int(submitted) if submitted is not None else None,
         COL_TOTAL: float(total_val) if total_val is not None else None,
         COL_BFP: float(bfp_val) if bfp_val is not None else None,
@@ -216,34 +249,31 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
 
 def make_snapshot(row: pd.Series) -> dict:
     ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
     metrics = extract_metrics_from_row(row)
 
     return {
         COL_TIMESTAMP: ts,
         COL_CODE: TARGET_PROCEDURE_CODE,
-        COL_NAME: metrics[COL_NAME],
-        COL_SUBMITTED: metrics[COL_SUBMITTED],
-        COL_TOTAL: metrics[COL_TOTAL],
-        COL_BFP: metrics[COL_BFP],
-        COL_APPROVED: metrics[COL_APPROVED],
-        COL_RESERVE: metrics[COL_RESERVE],
-        COL_REJECTED: metrics[COL_REJECTED],
+        COL_NAME: TARGET_PROCEDURE_NAME,
+        **metrics,
     }
 
 
 def load_existing(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
-        return pd.DataFrame(columns=[COL_TIMESTAMP, COL_CODE, COL_NAME] + METRIC_COLS)
+        return pd.DataFrame()
     return pd.read_csv(path)
 
 
 def _num_equal(a, b) -> bool:
-    # NaN/None considered equal
-    if (pd.isna(a) and pd.isna(b)) or (a is None and b is None):
+    # treat empty as equal
+    if (pd.isna(a) or a == "") and (pd.isna(b) or b == ""):
         return True
+
     try:
-        return abs(float(a) - float(b)) < 1e-6
+        fa = float(a)
+        fb = float(b)
+        return abs(fa - fb) < 1e-6
     except Exception:
         return str(a) == str(b)
 
@@ -254,46 +284,43 @@ def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
     if existing is None or existing.empty:
         return new_df
 
-    last = existing.iloc[-1]
-
-    # Only compare the 6 metrics (NOT timestamp/name/code)
+    # if columns missing (schema drift) -> append
     for c in METRIC_COLS:
         if c not in existing.columns:
             return pd.concat([existing, new_df], ignore_index=True)
-        if not _num_equal(last[c], new_row.get(c)):
-            return pd.concat([existing, new_df], ignore_index=True)
 
-    # identical metrics => do not append
-    return existing
+    last = existing.iloc[-1]
+
+    # only compare the 6 metrics (NOT timestamp)
+    changed = any(not _num_equal(last[c], new_row.get(c)) for c in METRIC_COLS)
+    if not changed:
+        return existing
+
+    return pd.concat([existing, new_df], ignore_index=True)
 
 
 def main():
     print("Fetching export…")
-    content = fetch_bytes(EXPORT_URL)
+    content = fetch_bytes_with_retries(EXPORT_URL)
 
     print("Parsing tables…")
-    tables = parse_html_tables(content)
+    table = parse_export_to_table(content)
 
-    print("Locating procedure table…")
-    filtered = find_procedure_table(tables)
-
-    print("Finding target row…")
-    row = find_target_row(filtered)
+    print("Finding target procedure row…")
+    row = find_target_row(table)
 
     snapshot = make_snapshot(row)
     print("Snapshot:", snapshot)
 
-    out_path = Path(OUT_CSV)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    existing = load_existing(str(out_path))
+    os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
+    existing = load_existing(OUT_CSV)
     updated = append_if_changed(existing, snapshot)
 
     if len(updated) == len(existing):
         print("No changes; nothing to append.")
         return
 
-    updated.to_csv(out_path, index=False)
+    updated.to_csv(OUT_CSV, index=False)
     print(f"Saved -> {OUT_CSV} (rows: {len(existing)} -> {len(updated)})")
 
 

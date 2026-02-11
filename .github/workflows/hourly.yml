@@ -27,12 +27,21 @@ jobs:
 
       - name: Run scraper
         env:
-          EXPORT_XML_URL: "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToHtml?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True"
+          EXPORT_URL: "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToHtml?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True"
           TARGET_PROCEDURE_CODE: "BG16RFPR002-1.010"
           TARGET_PROCEDURE_NAME: "Зелени и цифрови партньорства за интелигентна трансформация"
           OUT_CSV: "data/isun_bg16rfpr002-1.010_history.csv"
         run: |
           python scrape_isun.py
+
+      - name: Upload debug artifact (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isun-debug
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Commit & push if changed
         run: |
