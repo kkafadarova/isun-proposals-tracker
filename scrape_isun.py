@@ -125,24 +125,31 @@ def fetch_bytes_playwright(url: str) -> bytes:
             locale="bg-BG",
             viewport={"width": 1280, "height": 800},
         )
+
+        # 1) Warm-up page to get any cookies/session (optional but helps)
         page = context.new_page()
-
-        # warm-up (cookies / potential JS checks)
         page.goto("https://2020.eufunds.bg/bg/0/0", wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(1000)
 
-        resp = page.goto(url, wait_until="networkidle", timeout=90000)
-        if resp is None:
-            browser.close()
-            raise RuntimeError("Playwright: no response from goto().")
+        # 2) Fetch export via API request (NO download exception)
+        resp = context.request.get(
+            url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
+            },
+            timeout=90000,
+        )
 
-        # IMPORTANT: take response body (not DOM)
-        html = resp.text()
+        status = resp.status
+        body = resp.body()  # bytes
 
         browser.close()
 
-    return html.encode("utf-8", errors="ignore")
+    if status >= 400:
+        raise RuntimeError(f"Playwright request failed: HTTP {status}")
 
+    return body
 
 def fetch_bytes_with_fallback(url: str, attempts: int = 3) -> bytes:
     last_err = None
@@ -335,6 +342,8 @@ def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
 def main():
     print("Fetching export…")
     content = fetch_bytes_with_fallback(EXPORT_URL, attempts=3)
+    html = content.decode("utf-8", errors="replace")    
+    print("len(html) =", len(html))     
 
     print("Parsing tables…")
     tables = parse_html_tables(content)
