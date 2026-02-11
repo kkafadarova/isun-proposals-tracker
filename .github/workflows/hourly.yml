@@ -11,6 +11,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,6 +26,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Needed only because we have Playwright fallback
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install --with-deps chromium
+
       - name: Run scraper
         env:
           EXPORT_URL: "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToExcel?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True"
@@ -34,20 +40,12 @@ jobs:
         run: |
           python scrape_isun.py
 
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-files
-          path: debug
-          if-no-files-found: ignore
-
       - name: Commit & push if changed
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git add data/isun_bg16rfpr002-1.010_history.csv debug || true
+          git add data/isun_bg16rfpr002-1.010_history.csv
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
@@ -56,3 +54,11 @@ jobs:
 
           git commit -m "Append ISUN snapshot"
           git push
+
+      # If something fails, upload debug folder so you can open last_response.html/bin
+      - name: Upload debug artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isun-debug
+          path: debug/
