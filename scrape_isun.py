@@ -1,16 +1,15 @@
 import os
 import re
-import time
 from datetime import datetime, timezone
-from io import StringIO
-
+from io import BytesIO
 import pandas as pd
 import requests
 
 
+# Prefer Excel export (more machine-friendly than HTML)
 EXPORT_URL = os.getenv(
     "EXPORT_URL",
-    "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToHtml?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True",
+    "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToExcel?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True",
 )
 
 TARGET_PROCEDURE_CODE = os.getenv("TARGET_PROCEDURE_CODE", "BG16RFPR002-1.010")
@@ -21,8 +20,7 @@ TARGET_PROCEDURE_NAME = os.getenv(
 
 OUT_CSV = os.getenv("OUT_CSV", "data/isun_bg16rfpr002-1.010_history.csv")
 
-
-# --- Bulgarian column names (final CSV headers) ---
+# --- Final CSV headers (Bulgarian) ---
 COL_TIMESTAMP = "timestamp_utc"
 COL_CODE = "Номер на процедура"
 COL_NAME = "Име на процедура"
@@ -34,209 +32,159 @@ COL_RESERVE = "Брой проектни предложения в резерв�
 COL_REJECTED = "Брой отхвърлени проектни предложения"
 
 METRIC_COLS = [COL_SUBMITTED, COL_TOTAL, COL_BFP, COL_APPROVED, COL_RESERVE, COL_REJECTED]
+INT_COLS = [COL_SUBMITTED, COL_APPROVED, COL_RESERVE, COL_REJECTED]
 
 
-# ---------- helpers ----------
-def _collapse_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).replace("\xa0", " ")).strip()
+def _ensure_dir(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
 
-def _clean_number_str(x) -> str:
-    s = _collapse_ws(x)
-    s = s.replace(" ", "")
+def _clean_text(x) -> str:
+    s = "" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x)
+    s = s.replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _num_str(x) -> str:
+    # For comparisons, normalize numeric-like things to a canonical string.
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    s = _clean_text(x)
+    # Keep digits, minus, comma, dot
+    s = re.sub(r"[^\d\-,\.]", "", s)
+    # If "5,23" -> "5.23"
+    if s.count(",") == 1 and s.count(".") == 0:
+        s = s.replace(",", ".")
+    # If "1,234.56" -> "1234.56"
+    if "," in s and "." in s:
+        s = s.replace(",", "")
     return s
 
 
 def parse_int(x):
-    s = _clean_number_str(x)
-    if s == "":
+    s = _num_str(x)
+    if not s:
         return None
     s = re.sub(r"[^\d-]", "", s)
     return int(s) if s else None
 
 
 def parse_float(x):
-    s = _clean_number_str(x)
-    if s == "":
+    s = _num_str(x)
+    if not s:
         return None
-    s = re.sub(r"[^\d\-,\.]", "", s)
-
-    # "5,23" -> 5.23
-    if s.count(",") == 1 and s.count(".") == 0:
-        s = s.replace(",", ".")
-
-    # "1,234.56" -> 1234.56
-    if "," in s and "." in s:
-        s = s.replace(",", "")
-
-    return float(s) if s else None
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
-def is_protected_page(html: str) -> bool:
-    h = html.lower()
-    # crude but practical signals for anti-bot / challenge
-    return any(
-        token in h
-        for token in [
+def is_protected_page(content: bytes, content_type: str | None) -> bool:
+    # Heuristics: anti-bot pages usually come as HTML and contain common markers
+    ct = (content_type or "").lower()
+    if "text/html" in ct or ct == "" or ct.startswith("text/"):
+        head = content[:5000].decode("utf-8", errors="ignore").lower()
+        markers = [
+            "tspd",
             "apm_do_not_touch",
-            "/tspd/",
+            "enable javascript",
+            "please wait",
             "captcha",
-            "challenge",
-            "access denied",
-            "forbidden",
+            "checking your browser",
+            "<html",
         ]
-    )
+        return any(m in head for m in markers)
+    return False
 
 
-# ---------- fetching ----------
-def fetch_bytes_requests(url: str) -> bytes:
+def fetch_bytes(url: str) -> tuple[bytes, str]:
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (compatible; github-actions; +https://github.com)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
     }
-    r = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+    r = requests.get(url, headers=headers, timeout=90, allow_redirects=True)
     r.raise_for_status()
-
-    html = r.text
-    if is_protected_page(html):
-        os.makedirs("debug", exist_ok=True)
-        with open("debug/last_response_requests.html", "w", encoding="utf-8") as f:
-            f.write(html[:500000])
-        raise RuntimeError("ISUN returned a protected/anti-bot page (requests).")
-
-    return r.content
+    return r.content, r.headers.get("Content-Type", "")
 
 
-def fetch_bytes_playwright(url: str) -> bytes:
-    from playwright.sync_api import sync_playwright
+def fetch_with_debug(url: str) -> bytes:
+    _ensure_dir("debug/x")
+    content, ctype = fetch_bytes(url)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="bg-BG",
-            viewport={"width": 1280, "height": 800},
+    if is_protected_page(content, ctype):
+        _ensure_dir("debug/last_response.html")
+        with open("debug/last_response.html", "wb") as f:
+            f.write(content)
+        raise RuntimeError(
+            "ISUN returned a protected/anti-bot page. Saved to debug/last_response.html"
         )
 
-        # 1) Warm-up page to get any cookies/session (optional but helps)
-        page = context.new_page()
-        page.goto("https://2020.eufunds.bg/bg/0/0", wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(1000)
-
-        # 2) Fetch export via API request (NO download exception)
-        resp = context.request.get(
-            url,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
-            },
-            timeout=90000,
-        )
-
-        status = resp.status
-        body = resp.body()  # bytes
-
-        browser.close()
-
-    if status >= 400:
-        raise RuntimeError(f"Playwright request failed: HTTP {status}")
-
-    return body
-
-def fetch_bytes_with_fallback(url: str, attempts: int = 3) -> bytes:
-    last_err = None
-    for i in range(1, attempts + 1):
-        try:
-            return fetch_bytes_requests(url)
-        except Exception as e:
-            last_err = e
-            sleep_s = 2 * i
-            print(f"[requests attempt {i}/{attempts}] failed: {e} -> sleeping {sleep_s}s")
-            time.sleep(sleep_s)
-
-    print("Protected page detected (requests). Falling back to Playwright…")
-    return fetch_bytes_playwright(url)
+    return content
 
 
-# ---------- parsing ----------
-def parse_html_tables(content_bytes: bytes) -> list[pd.DataFrame]:
-    html = content_bytes.decode("utf-8", errors="replace")
-
-    if "<table" not in html.lower():
-        os.makedirs("debug", exist_ok=True)
-        with open("debug/last_playwright.html", "w", encoding="utf-8") as f:
-            f.write(html[:500000])
-        raise RuntimeError("No <table> in HTML (saved debug/last_playwright.html).")
-
-    # pandas may need bs4/html5lib depending on version
-    return pd.read_html(StringIO(html))
-
-
-def find_procedure_table(tables: list[pd.DataFrame]) -> pd.DataFrame:
+def read_table_from_export(content: bytes) -> pd.DataFrame:
     """
-    ISUN page has multiple tables; we want the one containing header like 'Номер на процедура'
-    or at least containing our procedure code/name.
+    Prefer reading Excel bytes; if not excel, try HTML.
     """
-    needle_code = TARGET_PROCEDURE_CODE
-    needle_name = TARGET_PROCEDURE_NAME
+    # Try Excel
+    try:
+        df = pd.read_excel(BytesIO(content), engine="openpyxl")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+    except Exception:
+        pass
 
-    # Prefer table which has "Номер на процедура" header
-    for t in tables:
-        cols = [str(c).strip() for c in t.columns]
-        if any("номер" in c.lower() and "процед" in c.lower() for c in cols):
-            return t
-
-    # Otherwise, pick first table that contains our target code/name anywhere
-    for t in tables:
-        tt = t.fillna("").astype(str)
-        mask = tt.apply(
-            lambda row: any((needle_code in cell) or (needle_name in cell) for cell in row),
-            axis=1,
+    # Try HTML (fallback)
+    try:
+        html = content.decode("utf-8", errors="replace")
+        tables = pd.read_html(html)
+        # Choose the table most likely to contain procedure rows (has the code column or many cols)
+        if not tables:
+            raise ValueError("No tables found")
+        # pick the widest table
+        tables_sorted = sorted(tables, key=lambda t: (t.shape[1], t.shape[0]), reverse=True)
+        return tables_sorted[0]
+    except Exception as e:
+        _ensure_dir("debug/last_non_excel_response.html")
+        with open("debug/last_non_excel_response.html", "wb") as f:
+            f.write(content)
+        raise RuntimeError(
+            f"Could not parse export as Excel or HTML tables. Saved debug/last_non_excel_response.html. ({e})"
         )
-        if mask.any():
-            return t
-
-    raise RuntimeError("Could not find a relevant procedure table in parsed tables.")
 
 
 def find_target_row(df: pd.DataFrame) -> pd.Series:
-    needle_code = TARGET_PROCEDURE_CODE
-    needle_name = TARGET_PROCEDURE_NAME
-
+    # robust search across all cells
     df_str = df.copy()
     df_str.columns = [str(c).strip() for c in df_str.columns]
     df_str = df_str.fillna("").astype(str)
+
+    needle_code = TARGET_PROCEDURE_CODE
+    needle_name = TARGET_PROCEDURE_NAME
 
     mask = df_str.apply(
         lambda row: any((needle_code in cell) or (needle_name in cell) for cell in row),
         axis=1,
     )
-
     hits = df.loc[mask]
     if hits.empty:
         raise RuntimeError(
-            "Не намерих таргет ред.\n"
-            f"Колони: {list(df.columns)}\n"
-            f"Търсих: {needle_code} / {needle_name}"
+            "Target procedure row not found in export.\n"
+            f"Looked for code={needle_code} or name contains '{needle_name}'.\n"
+            f"Columns: {list(df.columns)}"
         )
-
     return hits.iloc[0]
 
 
 def extract_metrics_from_row(row: pd.Series) -> dict:
     """
-    Expected row includes:
+    Expected row layout (as seen on the public page):
       code | name | submitted | total | bfp | approved | reserve | rejected
-    We do not rely on exact column names. We locate procedure code cell,
-    then scan forward and take first 6 numeric-looking cells.
+
+    We extract values by scanning cells after the code cell, grabbing 6 numeric tokens.
     """
     cells = ["" if pd.isna(v) else str(v) for v in row.tolist()]
 
@@ -247,20 +195,13 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
             break
 
     if code_idx is None:
-        # fallback: if code not present but name is present
-        for i, v in enumerate(cells):
-            if TARGET_PROCEDURE_NAME in v:
-                code_idx = i
-                break
-
-    if code_idx is None:
-        raise RuntimeError("Не намерих нито кода, нито името в таргет реда.")
+        raise RuntimeError("Could not locate the procedure code cell in the target row.")
 
     scan = cells[code_idx + 1 : code_idx + 1 + 30]
 
-    numeric_tokens = []
+    numeric_tokens: list[str] = []
     for v in scan:
-        vv = v.strip()
+        vv = _clean_text(v)
         if re.search(r"\d", vv):
             f = parse_float(vv)
             if f is not None:
@@ -269,7 +210,9 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
             break
 
     if len(numeric_tokens) < 6:
-        raise RuntimeError(f"Не успях да извлека 6 числови клетки. Намерих: {numeric_tokens}")
+        raise RuntimeError(
+            f"Could not extract 6 numeric cells from row. Extracted={numeric_tokens}"
+        )
 
     submitted = parse_int(numeric_tokens[0])
     total_val = parse_float(numeric_tokens[1])
@@ -279,18 +222,24 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
     rejected = parse_int(numeric_tokens[5])
 
     return {
-        COL_SUBMITTED: int(submitted) if submitted is not None else None,
-        COL_TOTAL: float(total_val) if total_val is not None else None,
-        COL_BFP: float(bfp_val) if bfp_val is not None else None,
-        COL_APPROVED: int(approved) if approved is not None else None,
-        COL_RESERVE: int(reserve) if reserve is not None else None,
-        COL_REJECTED: int(rejected) if rejected is not None else None,
+        COL_SUBMITTED: submitted,
+        COL_TOTAL: total_val,
+        COL_BFP: bfp_val,
+        COL_APPROVED: approved,
+        COL_RESERVE: reserve,
+        COL_REJECTED: rejected,
     }
 
 
 def make_snapshot(row: pd.Series) -> dict:
     ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     metrics = extract_metrics_from_row(row)
+
+    # enforce ints for count columns
+    for c in INT_COLS:
+        if metrics.get(c) is not None:
+            metrics[c] = int(metrics[c])
+
     return {
         COL_TIMESTAMP: ts,
         COL_CODE: TARGET_PROCEDURE_CODE,
@@ -299,41 +248,52 @@ def make_snapshot(row: pd.Series) -> dict:
     }
 
 
-# ---------- storage ----------
 def load_existing(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
     return pd.read_csv(path)
 
 
-def _num_equal(a, b) -> bool:
-    if pd.isna(a) and (b is None or pd.isna(b)):
+def _metric_equal(a, b) -> bool:
+    # treat NaN/None as equal
+    if (a is None or (isinstance(a, float) and pd.isna(a))) and (
+        b is None or (isinstance(b, float) and pd.isna(b))
+    ):
         return True
 
+    # compare ints strictly when both are ints
+    try:
+        ia = int(float(a))
+        ib = int(float(b))
+        # if both "look like ints", use strict
+        if abs(float(a) - ia) < 1e-9 and abs(float(b) - ib) < 1e-9:
+            return ia == ib
+    except Exception:
+        pass
+
+    # floats with tolerance
     try:
         fa = float(a)
         fb = float(b)
         return abs(fa - fb) < 1e-6
     except Exception:
-        return str(a) == str(b)
+        return _clean_text(a) == _clean_text(b)
 
 
-def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
-    new_df = pd.DataFrame([new_row])
+def append_if_changed(existing: pd.DataFrame, snapshot: dict) -> pd.DataFrame:
+    new_df = pd.DataFrame([snapshot])
 
     if existing is None or existing.empty:
         return new_df
 
     last = existing.iloc[-1]
 
-    # If columns missing (first run after schema change), append
+    # If metrics are identical -> do not append
     for c in METRIC_COLS:
         if c not in existing.columns:
+            # schema changed -> append
             return pd.concat([existing, new_df], ignore_index=True)
-
-    # Append only if at least one metric differs
-    for c in METRIC_COLS:
-        if not _num_equal(last[c], new_row.get(c)):
+        if not _metric_equal(last[c], snapshot.get(c)):
             return pd.concat([existing, new_df], ignore_index=True)
 
     return existing
@@ -341,34 +301,27 @@ def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
 
 def main():
     print("Fetching export…")
-    content = fetch_bytes_with_fallback(EXPORT_URL, attempts=3)
-    html = content.decode("utf-8", errors="replace")    
-    print("len(html) =", len(html))     
+    content = fetch_with_debug(EXPORT_URL)
 
-    print("Parsing tables…")
-    tables = parse_html_tables(content)
-
-    table = find_procedure_table(tables)
+    print("Parsing export…")
+    df = read_table_from_export(content)
 
     print("Finding target procedure row…")
-    row = find_target_row(table)
+    row = find_target_row(df)
 
     snapshot = make_snapshot(row)
     print("Snapshot:", snapshot)
 
-    out_dir = os.path.dirname(OUT_CSV) or "."
-    os.makedirs(out_dir, exist_ok=True)
-
+    _ensure_dir(OUT_CSV)
     existing = load_existing(OUT_CSV)
     updated = append_if_changed(existing, snapshot)
 
-    if existing is not None and len(updated) == len(existing):
+    if len(updated) == len(existing):
         print("No changes; nothing to append.")
         return
 
     updated.to_csv(OUT_CSV, index=False)
-    prev_len = 0 if existing is None else len(existing)
-    print(f"Saved -> {OUT_CSV} (rows: {prev_len} -> {len(updated)})")
+    print(f"Saved -> {OUT_CSV} (rows: {len(existing)} -> {len(updated)})")
 
 
 if __name__ == "__main__":

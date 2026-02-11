@@ -1,37 +1,35 @@
 # ISUN Project Proposals Tracker
 
-An automated **hourly** tracker for **ISUN 2020** project proposals that monitors **one specific procedure** and stores **historical snapshots** (append-only), without overwriting old data.
+An hourly tracker for **ISUN 2020** public project proposals that monitors **one specific procedure** and stores **historical snapshots** (append-only) without overwriting older data.
 
 Currently configured for:
 
-**BG16RFPR002-1.010 —  
-“Green and Digital Partnerships for Smart Transformation”**  
-(„Зелени и цифрови партньорства за интелигентна трансформация“)
+**BG16RFPR002-1.010 — “Green and Digital Partnerships for Intelligent Transformation”**  
+(“Зелени и цифрови партньорства за интелигентна трансформация”)
 
 ---
 
-## What this project does
+## What it does
 
-- ⏱️ Runs **automatically every hour** (GitHub Actions cron)
-- 🌐 Fetches the public export from ISUN 2020 (HTML export page)
-- 🧩 Uses a **Playwright fallback** if ISUN returns an anti-bot JS page (TSPD)
-- 🔎 Locates the row for the target procedure (by code or name)
+- ⏱️ Runs **every hour** via GitHub Actions cron
+- 🌐 Fetches the public export from ISUN 2020 (prefers **Excel export** for reliability)
+- 🔎 Finds the row for the target procedure
 - 📊 Extracts these metrics:
   - Number of submitted project proposals
-  - Total value of submitted project proposals
-  - EU grant amount (BFP) of submitted project proposals (EUR)
+  - Total value of submitted proposals (EUR)
+  - EU grant value (BFP) of submitted proposals (EUR)
   - Number of approved proposals
-  - Number of proposals on the reserve list
+  - Number of reserve-list proposals
   - Number of rejected proposals
-- 🧠 **Appends a new row only if the numbers changed**
-- 🗂️ Stores history in a CSV file (append-only)
-- 🤖 Auto-commit + push to the repo when a new snapshot is appended
+- 🧠 Appends a **new CSV row only when the metric values change**
+- 🗂️ Writes append-only history to a CSV file
+- 🤖 Commits & pushes only if the CSV changed
 
 ---
 
-## Output (CSV)
+## Output data
 
-Data is stored in:
+The history is stored in:
 
 `data/isun_bg16rfpr002-1.010_history.csv`
 
@@ -40,19 +38,20 @@ Data is stored in:
 | timestamp_utc | Номер на процедура | Име на процедура | Брой подадени проектни предложения | Обща стойност на подадените проектни предложения | Стойност на подадените проектни предложения БФП (в евро) | Брой одобрени проектни предложения | Брой проектни предложения в резервен списък | Брой отхвърлени проектни предложения |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Notes:
-- `timestamp_utc` is ISO 8601 in UTC
-- Count fields are integers
-- Value fields are floats (EUR)
-- No duplicates are added if the metric values remain unchanged
+- `timestamp_utc` is ISO 8601 (UTC)
+- Count fields are stored as **integers**
+- Value fields are stored as **floats (EUR)**
+- No duplicate rows are appended when values do not change
 
 ---
 
 ## Data source
 
-ISUN public export (HTML):
+Public ISUN export (Excel):
 
-`https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToHtml?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True`
+`https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToExcel?ProgrammeId=...&ShowRes=True`
+
+> Note: ISUN may occasionally return an anti-bot/protected page. In such cases the workflow will fail and save the last response under `debug/` for inspection.
 
 ---
 
@@ -60,14 +59,14 @@ ISUN public export (HTML):
 
 Workflow file:
 
-`.github/workflows/hourly.yml`
+- `.github/workflows/hourly.yml`
 
-What it does:
-1. Sets up Python
-2. Installs dependencies
-3. Installs Playwright Chromium
-4. Runs `scrape_isun.py`
-5. Commits & pushes **only if the CSV changed**
+Steps:
+
+1. Setup Python
+2. Install dependencies
+3. Run `scrape_isun.py`
+4. Commit & push **only if the CSV changed**
 
 You can also run it manually:
 **Actions → Track ISUN proposals (hourly) → Run workflow**
