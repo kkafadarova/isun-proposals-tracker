@@ -89,7 +89,8 @@ def parse_export_to_table(content_bytes: bytes) -> pd.DataFrame:
     for t in tables:
         tt = t.copy()
         tt.columns = [str(c).strip() for c in tt.columns]
-        tt = tt.applymap(lambda x: "" if pd.isna(x) else str(x))
+        tt = tt.fillna("").astype(str)
+
 
         mask = tt.apply(
             lambda row: any((needle_code in cell) or (needle_name in cell) for cell in row),
@@ -116,7 +117,7 @@ def find_target_row(df: pd.DataFrame) -> pd.Series:
 
     df_str = df.copy()
     df_str.columns = [str(c).strip() for c in df_str.columns]
-    df_str = df_str.applymap(lambda x: "" if pd.isna(x) else str(x))
+    df_str = df_str.fillna("").astype(str)
 
     mask = df_str.apply(
         lambda row: any((needle_code in cell) or (needle_name in cell) for cell in row),
