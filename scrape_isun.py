@@ -13,7 +13,6 @@ import requests
 # -----------------------
 EXPORT_URL = os.getenv(
     "EXPORT_URL",
-    # You can pass ExportToHtml / ExportToXml here; script will prefer ExportToExcel anyway
     "https://2020.eufunds.bg/bg/0/0/ProjectProposals/ExportToExcel?ProgrammeId=yIyRFEzMEDyPTP0ZcYrk5g%3D%3D&ShowRes=True",
 )
 
@@ -49,9 +48,7 @@ METRIC_COLS = [COL_SUBMITTED, COL_TOTAL, COL_BFP, COL_APPROVED, COL_RESERVE, COL
 # Utils
 # -----------------------
 def to_excel_url(url: str) -> str:
-    # If user passes ExportToHtml/Xml, swap to ExportToExcel
-    url = url.replace("ExportToHtml", "ExportToExcel").replace("ExportToXml", "ExportToExcel")
-    return url
+    return url.replace("ExportToHtml", "ExportToExcel").replace("ExportToXml", "ExportToExcel")
 
 
 def now_utc_iso() -> str:
@@ -66,11 +63,8 @@ def parse_int(x):
     s = _clean_ws(x)
     if s == "" or s.lower() == "nan":
         return None
-    # remove everything except digits and minus
     s = re.sub(r"[^\d-]", "", s)
-    if s == "":
-        return None
-    return int(s)
+    return int(s) if s else None
 
 
 def parse_float(x):
@@ -78,47 +72,53 @@ def parse_float(x):
     if s == "" or s.lower() == "nan":
         return None
 
-    # keep digits, comma, dot, minus
     s = re.sub(r"[^\d\-,\.]", "", s)
 
-    # Bulgarian decimal "5,23" -> "5.23"
+    # "5,23" -> 5.23
     if s.count(",") == 1 and s.count(".") == 0:
         s = s.replace(",", ".")
 
-    # thousands separator "1,234.56" -> "1234.56"
+    # "1,234.56" -> 1234.56
     if "," in s and "." in s:
         s = s.replace(",", "")
 
-    if s == "" or s == "-" or s == ".":
-        return None
-    return float(s)
+    return float(s) if s else None
+
+
+def looks_like_xlsx(content: bytes) -> bool:
+    return content[:2] == b"PK"
 
 
 def is_probably_protected_html(content: bytes, content_type: str | None) -> bool:
-    # common cases:
-    # - content-type text/html
-    # - HTML includes "APM_DO_NOT_TOUCH", "TSPD", "Incapsula", etc.
     if content_type and "text/html" in content_type.lower():
-        text = content[:5000].decode("utf-8", errors="ignore")
-        markers = ["APM_DO_NOT_TOUCH", "TSPD", "Incapsula", "cloudflare", "captcha", "<html"]
-        if any(m.lower() in text.lower() for m in markers):
-            return True
+        text = content[:8000].decode("utf-8", errors="ignore").lower()
+        markers = ["apm_do_not_touch", "tspd", "incapsula", "captcha", "cloudflare", "<html"]
+        return any(m in text for m in markers)
 
-    # if it looks like HTML anyway
     head = content[:20].lstrip()
     if head.startswith(b"<") or head.startswith(b"<!DOCTYPE"):
-        text = content[:5000].decode("utf-8", errors="ignore")
-        if "APM_DO_NOT_TOUCH" in text or "TSPD" in text or "captcha" in text.lower():
-            return True
+        text = content[:8000].decode("utf-8", errors="ignore").lower()
+        markers = ["apm_do_not_touch", "tspd", "incapsula", "captcha", "cloudflare"]
+        return any(m in text for m in markers)
 
     return False
 
 
-def looks_like_xlsx(content: bytes) -> bool:
-    # xlsx is a zip: starts with PK\x03\x04
-    return content[:2] == b"PK"
+def save_debug(name: str, data: bytes):
+    path = os.path.join(DEBUG_DIR, name)
+    with open(path, "wb") as f:
+        f.write(data)
 
 
+def save_debug_text(name: str, text: str):
+    path = os.path.join(DEBUG_DIR, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+# -----------------------
+# Fetch (requests + Playwright fallback)
+# -----------------------
 def requests_fetch(url: str, timeout: int = 60) -> bytes:
     session = requests.Session()
     headers = {
@@ -127,13 +127,11 @@ def requests_fetch(url: str, timeout: int = 60) -> bytes:
             "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
         ),
         "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;q=0.9,"
-            "*/*;q=0.8"
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         ),
         "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
         "Referer": "https://2020.eufunds.bg/bg/0/0/ProjectProposals",
     }
 
@@ -141,29 +139,31 @@ def requests_fetch(url: str, timeout: int = 60) -> bytes:
     ct = r.headers.get("content-type", "")
     content = r.content
 
-    # save last response for debug always
-    with open(os.path.join(DEBUG_DIR, "last_response.bin"), "wb") as f:
-        f.write(content)
-    with open(os.path.join(DEBUG_DIR, "last_response_headers.txt"), "w", encoding="utf-8") as f:
-        f.write(f"URL: {r.url}\nSTATUS: {r.status_code}\nCONTENT-TYPE: {ct}\n\nHEADERS:\n{dict(r.headers)}\n")
+    save_debug("last_response.bin", content)
+    save_debug_text(
+        "last_response_headers.txt",
+        f"URL: {r.url}\nSTATUS: {r.status_code}\nCONTENT-TYPE: {ct}\n\nHEADERS:\n{dict(r.headers)}\n",
+    )
 
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code} from ISUN")
 
     if is_probably_protected_html(content, ct):
-        with open(os.path.join(DEBUG_DIR, "last_response.html"), "wb") as f:
-            f.write(content)
-        raise RuntimeError("ISUN returned a protected/anti-bot page.")
+        save_debug("last_response.html", content)
+        raise RuntimeError("ISUN returned a protected/anti-bot page (requests).")
 
     return content
 
 
-def playwright_download(url: str) -> bytes:
+def playwright_fetch_via_request_context(url: str) -> bytes:
     """
-    Uses Playwright to handle cases where requests gets blocked.
-    Works well for ExportToExcel (download).
+    Robust Playwright fallback:
+    - visit site first to set cookies (anti-bot)
+    - then fetch the Excel via browser request context (no download event needed)
     """
     from playwright.sync_api import sync_playwright
+
+    base_url = "https://2020.eufunds.bg/bg/0/0/ProjectProposals"
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -176,78 +176,72 @@ def playwright_download(url: str) -> bytes:
         )
         page = context.new_page()
 
-        # Expect a download
-        with page.expect_download(timeout=120000) as dl_info:
-            page.goto(url, wait_until="domcontentloaded", timeout=120000)
-        download = dl_info.value
-        path = download.path()
-        if not path:
-            # sometimes path is None; save via download.save_as
-            save_to = os.path.join(DEBUG_DIR, "last_download.xlsx")
-            download.save_as(save_to)
-            with open(save_to, "rb") as f:
-                data = f.read()
-        else:
-            with open(path, "rb") as f:
-                data = f.read()
+        # Warm-up navigation to get cookies
+        try:
+            page.goto(base_url, wait_until="domcontentloaded", timeout=120000)
+        except Exception:
+            # even if warm-up fails, still try request
+            pass
 
-        # Save for debug
-        with open(os.path.join(DEBUG_DIR, "last_playwright_download.bin"), "wb") as f:
-            f.write(data)
+        # Real fetch via request context
+        resp = context.request.get(
+            url,
+            headers={
+                "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*;q=0.8",
+                "Referer": base_url,
+                "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
+            },
+            timeout=120000,
+        )
+
+        status = resp.status
+        ct = resp.headers.get("content-type", "")
+        body = resp.body()
+
+        save_debug("last_playwright_response.bin", body)
+        save_debug_text(
+            "last_playwright_response_headers.txt",
+            f"STATUS: {status}\nCONTENT-TYPE: {ct}\nHEADERS: {resp.headers}\n",
+        )
 
         browser.close()
-        return data
+
+        if status >= 400:
+            raise RuntimeError(f"Playwright request failed: HTTP {status}")
+
+        if is_probably_protected_html(body, ct):
+            save_debug("last_playwright_response.html", body)
+            raise RuntimeError("ISUN returned a protected/anti-bot page (playwright request).")
+
+        return body
 
 
 def fetch_with_fallback(url: str) -> bytes:
-    """
-    Prefer Excel export. If requests gets blocked, fallback to Playwright download.
-    """
     excel_url = to_excel_url(url)
     print(f"Using export URL: {excel_url}")
 
-    # Try requests first
     try:
-        content = requests_fetch(excel_url)
-        return content
+        return requests_fetch(excel_url)
     except Exception as e:
         print(f"[requests] failed: {e}")
-        print("Falling back to Playwright…")
-        content = playwright_download(excel_url)
-
-        # If still HTML (blocked), save and fail
-        if is_probably_protected_html(content, "text/html"):
-            with open(os.path.join(DEBUG_DIR, "last_playwright.html"), "wb") as f:
-                f.write(content)
-            raise RuntimeError("Playwright also got a protected/anti-bot HTML page.")
-
-        return content
+        print("Falling back to Playwright request context…")
+        return playwright_fetch_via_request_context(excel_url)
 
 
 # -----------------------
 # Parsing
 # -----------------------
 def read_table_from_export(content: bytes) -> pd.DataFrame:
-    """
-    ISUN ExportToExcel returns .xlsx (zip). Parse it.
-    """
     if not looks_like_xlsx(content):
-        # if it is HTML, save it and raise
-        with open(os.path.join(DEBUG_DIR, "last_non_excel_response.html"), "wb") as f:
-            f.write(content)
+        save_debug("last_non_excel_response.bin", content)
         raise RuntimeError("Export response is not XLSX (does not start with PK).")
 
-    # Most exports have a single sheet with the table. Read first sheet.
-    xls = pd.read_excel(BytesIO(content), sheet_name=0)
-    # Normalize columns to strings
-    xls.columns = [str(c).strip() for c in xls.columns]
-    return xls
+    df = pd.read_excel(BytesIO(content), sheet_name=0)  # requires openpyxl in requirements
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 
 def find_target_row(df: pd.DataFrame) -> pd.Series:
-    """
-    Robust search: find first row where ANY cell contains the procedure code or procedure name.
-    """
     df_str = df.fillna("").astype(str)
     needle_code = TARGET_PROCEDURE_CODE
     needle_name = TARGET_PROCEDURE_NAME
@@ -266,11 +260,6 @@ def find_target_row(df: pd.DataFrame) -> pd.Series:
 
 
 def extract_metrics_from_row(row: pd.Series) -> dict:
-    """
-    Expected row format (from Excel export):
-      Procedure code | name | submitted | total | bfp | approved | reserve | rejected
-    We extract the 6 metrics robustly by scanning numeric cells after the code.
-    """
     cells = ["" if pd.isna(v) else str(v) for v in row.tolist()]
 
     code_idx = None
@@ -278,12 +267,13 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
         if TARGET_PROCEDURE_CODE in v:
             code_idx = i
             break
+
     if code_idx is None:
-        # Sometimes code is in different cell formatting, fallback name search
         for i, v in enumerate(cells):
             if TARGET_PROCEDURE_NAME in v:
-                code_idx = max(0, i - 1)  # heuristic
+                code_idx = max(0, i - 1)
                 break
+
     if code_idx is None:
         raise RuntimeError("Could not locate code/name cell inside target row to extract numbers.")
 
@@ -293,7 +283,6 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
     for v in scan:
         vv = _clean_ws(v)
         if re.search(r"\d", vv):
-            # accept both ints and floats
             f = parse_float(vv)
             if f is not None:
                 numeric_tokens.append(vv)
@@ -310,7 +299,6 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
     reserve = parse_int(numeric_tokens[4])
     rejected = parse_int(numeric_tokens[5])
 
-    # Ensure counts are int (not decimals)
     return {
         COL_SUBMITTED: int(submitted) if submitted is not None else None,
         COL_TOTAL: float(total_val) if total_val is not None else None,
@@ -328,18 +316,10 @@ def load_existing(path: str) -> pd.DataFrame:
 
 
 def _num_equal(a, b) -> bool:
-    """
-    Compare numbers robustly:
-    - NaN/None treated as equal
-    - floats with tolerance
-    - ints exact
-    """
     if (pd.isna(a) or a is None) and (pd.isna(b) or b is None):
         return True
     try:
-        fa = float(a)
-        fb = float(b)
-        return abs(fa - fb) < 1e-6
+        return abs(float(a) - float(b)) < 1e-6
     except Exception:
         return str(a) == str(b)
 
@@ -350,19 +330,14 @@ def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
     if existing is None or existing.empty:
         return new_df
 
-    # If columns mismatch, append (but keep going)
-    for c in [COL_TIMESTAMP, COL_CODE, COL_NAME] + METRIC_COLS:
+    # compare ONLY metric columns; do not append if identical
+    last = existing.iloc[-1]
+    for c in METRIC_COLS:
         if c not in existing.columns:
             return pd.concat([existing, new_df], ignore_index=True)
-
-    last = existing.iloc[-1]
-
-    # Compare only the 6 metric columns (NOT timestamp)
-    for c in METRIC_COLS:
         if not _num_equal(last[c], new_row.get(c)):
             return pd.concat([existing, new_df], ignore_index=True)
 
-    # No changes -> no append
     return existing
 
 
@@ -403,6 +378,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Always leave a clear error
         print(f"ERROR: {e}", file=sys.stderr)
         raise
