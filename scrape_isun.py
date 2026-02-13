@@ -161,11 +161,15 @@ def requests_fetch(url: str, timeout: int = 60) -> bytes:
     return content
 
 
-def playwright_fetch_via_browser_download(url: str) -> bytes:
+def playwright_fetch(url: str) -> bytes:
+    """
+    Playwright fallback that DOES NOT wait for a download event.
+    It navigates and inspects the main response.
+    If the site serves an anti-bot HTML page, we save it and fail clearly.
+    """
     from playwright.sync_api import sync_playwright
 
     base_url = "https://2020.eufunds.bg/bg/0/0/ProjectProposals"
-
     headless = os.getenv("PW_HEADLESS", "1") != "0"
     slowmo = int(os.getenv("PW_SLOWMO", "0") or "0")
 
@@ -177,46 +181,58 @@ def playwright_fetch_via_browser_download(url: str) -> bytes:
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
             ),
-            accept_downloads=True,
         )
         page = context.new_page()
 
-        page.goto("https://2020.eufunds.bg/", wait_until="domcontentloaded")
+        # Warm-up for cookies / potential JS challenge
+        page.goto("https://2020.eufunds.bg/", wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(1500)
-        page.goto(base_url, wait_until="domcontentloaded")
+        page.goto(base_url, wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(1500)
 
-        try:
-            with page.expect_download(timeout=120000) as dl_info:
-                page.goto(url, wait_until="domcontentloaded")
+        # Navigate to export URL and capture the response
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=120000)
+        if resp is None:
+            html = page.content()
+            save_debug_text("pw_no_response.html", html)
+            raise RuntimeError("Playwright: no main response (likely blocked or navigation failed).")
 
-            download = dl_info.value
-            tmp_path = download.path()
+        status = resp.status
+        headers = resp.headers
+        ct = (headers.get("content-type") or "").lower()
 
-            if tmp_path:
-                with open(tmp_path, "rb") as f:
-                    data = f.read()
-            else:
-                tmp = os.path.join(DEBUG_DIR, "pw_download.xlsx")
-                download.save_as(tmp)
-                with open(tmp, "rb") as f:
-                    data = f.read()
+        # If it's an Excel-like response, grab bytes
+        if "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ct:
+            body = resp.body()
+            save_debug("pw_export.bin", body)
+        else:
+            # Often it will be HTML due to anti-bot
+            html = page.content()
+            save_debug_text(
+                "pw_export_headers.txt",
+                f"STATUS: {status}\nCONTENT-TYPE: {ct}\nURL: {resp.url}\nHEADERS: {headers}\n",
+            )
+            save_debug_text("pw_export_page.html", html)
+            # Also try response body (may be HTML too)
+            try:
+                body = resp.body()
+                save_debug("pw_export_response_body.bin", body)
+            except Exception:
+                body = b""
 
-            save_debug("last_playwright_download.bin", data)
+            # Detect protection
+            if is_probably_protected_html(body or html.encode("utf-8", "ignore"), ct or "text/html"):
+                raise RuntimeError("Playwright: ISUN served anti-bot HTML (no XLSX).")
 
-            if is_probably_protected_html(data, None):
-                save_debug("last_playwright_download.html", data)
-                raise RuntimeError("Playwright returned HTML (anti-bot page).")
+            raise RuntimeError(f"Playwright: unexpected content-type '{ct}', status={status}")
 
-            if not looks_like_xlsx(data):
-                raise RuntimeError("Downloaded file is not valid XLSX.")
+        context.close()
+        browser.close()
 
-            return data
+        if not looks_like_xlsx(body):
+            raise RuntimeError("Playwright: response is not XLSX (missing PK header).")
 
-        finally:
-            context.close()
-            browser.close()
-
+        return body
 
 def fetch_with_fallback(url: str) -> bytes:
     excel_url = to_excel_url(url)
@@ -226,8 +242,8 @@ def fetch_with_fallback(url: str) -> bytes:
         return requests_fetch(excel_url)
     except Exception as e:
         print(f"[requests] failed: {e}")
-        print("Falling back to Playwright browser download…")
-        return playwright_fetch_via_browser_download(excel_url)
+        print("Falling back to Playwright navigation fetch…")
+        return playwright_fetch(excel_url)
 
 
 # -----------------------
