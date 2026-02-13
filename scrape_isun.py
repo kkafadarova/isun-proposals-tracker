@@ -321,7 +321,7 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
 
 
 def main():
-    print("Fetching export…")
+        print("Fetching export…")
     try:
         content = fetch_with_fallback(EXPORT_URL)
     except Exception as e:
@@ -331,7 +331,6 @@ def main():
             print("No update performed. Exiting with code 0.")
             return
         raise
-
 
     print("Parsing export…")
     df = read_table_from_export(content)
@@ -348,24 +347,21 @@ def main():
         **metrics,
     }
 
+    snapshot = normalize_snapshot(snapshot)
+
     print("Snapshot:", snapshot)
 
     os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
 
-    if os.path.exists(OUT_CSV):
-        existing = pd.read_csv(OUT_CSV)
-    else:
-        existing = pd.DataFrame()
+    existing = load_existing(OUT_CSV)
+    updated = append_if_changed(existing, snapshot)
 
-existing = load_existing(OUT_CSV)
-updated = append_if_changed(existing, snapshot)
+    if len(updated) == len(existing):
+        print("No changes; nothing to append.")
+        return  
 
-if len(updated) == len(existing):
-    print("No changes; nothing to append.")
-    return
-
-updated.to_csv(OUT_CSV, index=False)
-print(f"Saved -> {OUT_CSV} (rows: {len(existing)} -> {len(updated)})")
+    updated.to_csv(OUT_CSV, index=False)
+    print(f"Saved -> {OUT_CSV} (rows: {len(existing)} -> {len(updated)})")
 
 
 if __name__ == "__main__":
