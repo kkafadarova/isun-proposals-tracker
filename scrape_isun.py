@@ -7,7 +7,6 @@ from io import BytesIO
 import pandas as pd
 import requests
 
-
 # -----------------------
 # Config
 # -----------------------
@@ -23,10 +22,11 @@ TARGET_PROCEDURE_NAME = os.getenv(
 )
 
 OUT_CSV = os.getenv("OUT_CSV", "data/isun_bg16rfpr002-1.010_history.csv")
-
 DEBUG_DIR = "debug"
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
+# If blocked by anti-bot in CI, exit(0) instead of failing the job
+SKIP_ON_BLOCK = os.getenv("SKIP_ON_BLOCK", "1") == "1"
 
 # -----------------------
 # Final CSV headers (Bulgarian)
@@ -41,23 +41,13 @@ COL_APPROVED = "Брой одобрени проектни предложени�
 COL_RESERVE = "Брой проектни предложения в резервен списък"
 COL_REJECTED = "Брой отхвърлени проектни предложения"
 
-METRIC_COLS = [
-    COL_SUBMITTED,
-    COL_TOTAL,
-    COL_BFP,
-    COL_APPROVED,
-    COL_RESERVE,
-    COL_REJECTED,
-]
-
+METRIC_COLS = [COL_SUBMITTED, COL_TOTAL, COL_BFP, COL_APPROVED, COL_RESERVE, COL_REJECTED]
 
 # -----------------------
 # Utils
 # -----------------------
 def to_excel_url(url: str) -> str:
-    return url.replace("ExportToHtml", "ExportToExcel").replace(
-        "ExportToXml", "ExportToExcel"
-    )
+    return url.replace("ExportToHtml", "ExportToExcel").replace("ExportToXml", "ExportToExcel")
 
 
 def now_utc_iso() -> str:
@@ -83,9 +73,11 @@ def parse_float(x):
 
     s = re.sub(r"[^\d\-,\.]", "", s)
 
+    # "5,23" -> 5.23
     if s.count(",") == 1 and s.count(".") == 0:
         s = s.replace(",", ".")
 
+    # "1,234.56" -> 1234.56
     if "," in s and "." in s:
         s = s.replace(",", "")
 
@@ -99,13 +91,13 @@ def looks_like_xlsx(content: bytes) -> bool:
 def is_probably_protected_html(content: bytes, content_type: str | None) -> bool:
     if content_type and "text/html" in content_type.lower():
         text = content[:8000].decode("utf-8", errors="ignore").lower()
-        markers = ["apm_do_not_touch", "tspd", "incapsula", "captcha", "cloudflare"]
+        markers = ["apm_do_not_touch", "tspd", "incapsula", "captcha", "cloudflare", "attention required"]
         return any(m in text for m in markers)
 
     head = content[:20].lstrip()
     if head.startswith(b"<") or head.startswith(b"<!DOCTYPE"):
         text = content[:8000].decode("utf-8", errors="ignore").lower()
-        markers = ["apm_do_not_touch", "tspd", "incapsula", "captcha", "cloudflare"]
+        markers = ["apm_do_not_touch", "tspd", "incapsula", "captcha", "cloudflare", "attention required"]
         return any(m in text for m in markers)
 
     return False
@@ -121,6 +113,22 @@ def save_debug_text(name: str, text: str):
     path = os.path.join(DEBUG_DIR, name)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+
+
+def normalize_snapshot(snapshot: dict) -> dict:
+    snap = dict(snapshot)
+
+    for k in [COL_TOTAL, COL_BFP]:
+        v = snap.get(k)
+        if v is not None and not pd.isna(v):
+            snap[k] = round(float(v), 2)
+
+    for k in [COL_SUBMITTED, COL_APPROVED, COL_RESERVE, COL_REJECTED]:
+        v = snap.get(k)
+        if v is not None and not pd.isna(v):
+            snap[k] = int(v)
+
+    return snap
 
 
 # -----------------------
@@ -163,9 +171,7 @@ def requests_fetch(url: str, timeout: int = 60) -> bytes:
 
 def playwright_fetch(url: str) -> bytes:
     """
-    Playwright fallback that DOES NOT wait for a download event.
-    It navigates and inspects the main response.
-    If the site serves an anti-bot HTML page, we save it and fail clearly.
+    Playwright fallback: navigate and inspect main response (no download event).
     """
     from playwright.sync_api import sync_playwright
 
@@ -184,44 +190,40 @@ def playwright_fetch(url: str) -> bytes:
         )
         page = context.new_page()
 
-        # Warm-up for cookies / potential JS challenge
         page.goto("https://2020.eufunds.bg/", wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(1500)
         page.goto(base_url, wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(1500)
 
-        # Navigate to export URL and capture the response
         resp = page.goto(url, wait_until="domcontentloaded", timeout=120000)
         if resp is None:
             html = page.content()
             save_debug_text("pw_no_response.html", html)
-            raise RuntimeError("Playwright: no main response (likely blocked or navigation failed).")
+            raise RuntimeError("Playwright: no main response (likely blocked).")
 
         status = resp.status
-        headers = resp.headers
-        ct = (headers.get("content-type") or "").lower()
+        ct = (resp.headers.get("content-type") or "").lower()
 
-        # If it's an Excel-like response, grab bytes
+        save_debug_text(
+            "pw_export_headers.txt",
+            f"STATUS: {status}\nCONTENT-TYPE: {ct}\nURL: {resp.url}\nHEADERS: {resp.headers}\n",
+        )
+
+        # If excel content-type, take bytes
         if "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ct:
             body = resp.body()
             save_debug("pw_export.bin", body)
         else:
-            # Often it will be HTML due to anti-bot
             html = page.content()
-            save_debug_text(
-                "pw_export_headers.txt",
-                f"STATUS: {status}\nCONTENT-TYPE: {ct}\nURL: {resp.url}\nHEADERS: {headers}\n",
-            )
             save_debug_text("pw_export_page.html", html)
-            # Also try response body (may be HTML too)
             try:
                 body = resp.body()
                 save_debug("pw_export_response_body.bin", body)
             except Exception:
                 body = b""
 
-            # Detect protection
-            if is_probably_protected_html(body or html.encode("utf-8", "ignore"), ct or "text/html"):
+            blob = body if body else html.encode("utf-8", errors="ignore")
+            if is_probably_protected_html(blob, ct or "text/html"):
                 raise RuntimeError("Playwright: ISUN served anti-bot HTML (no XLSX).")
 
             raise RuntimeError(f"Playwright: unexpected content-type '{ct}', status={status}")
@@ -233,6 +235,7 @@ def playwright_fetch(url: str) -> bytes:
             raise RuntimeError("Playwright: response is not XLSX (missing PK header).")
 
         return body
+
 
 def fetch_with_fallback(url: str) -> bytes:
     excel_url = to_excel_url(url)
@@ -263,8 +266,7 @@ def find_target_row(df: pd.DataFrame) -> pd.Series:
 
     mask = df_str.apply(
         lambda row: any(
-            (TARGET_PROCEDURE_CODE in cell)
-            or (TARGET_PROCEDURE_NAME in cell)
+            (TARGET_PROCEDURE_CODE in cell) or (TARGET_PROCEDURE_NAME in cell)
             for cell in row
         ),
         axis=1,
@@ -308,7 +310,7 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
             break
 
     if len(numeric_tokens) < 6:
-        raise RuntimeError("Could not extract metric cells.")
+        raise RuntimeError(f"Could not extract 6 metric cells. Got: {numeric_tokens}")
 
     return {
         COL_SUBMITTED: parse_int(numeric_tokens[0]),
@@ -320,13 +322,52 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
     }
 
 
+# -----------------------
+# CSV history logic: append only if changed
+# -----------------------
+def load_existing(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def _num_equal(a, b) -> bool:
+    if (pd.isna(a) or a is None) and (pd.isna(b) or b is None):
+        return True
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except Exception:
+        return str(a) == str(b)
+
+
+def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
+    new_df = pd.DataFrame([new_row])
+
+    if existing is None or existing.empty:
+        return new_df
+
+    last = existing.iloc[-1]
+    for c in METRIC_COLS:
+        if c not in existing.columns:
+            return pd.concat([existing, new_df], ignore_index=True)
+        if not _num_equal(last[c], new_row.get(c)):
+            return pd.concat([existing, new_df], ignore_index=True)
+
+    return existing
+
+
+# -----------------------
+# Main
+# -----------------------
 def main():
-        print("Fetching export…")
+    print("Fetching export…")
     try:
         content = fetch_with_fallback(EXPORT_URL)
     except Exception as e:
         msg = str(e).lower()
-        if SKIP_ON_BLOCK and ("anti-bot" in msg or "protected" in msg or "text/html" in msg or "captcha" in msg):
+        if SKIP_ON_BLOCK and (
+            "anti-bot" in msg or "protected" in msg or "captcha" in msg or "text/html" in msg
+        ):
             print(f"SKIP: blocked by anti-bot protection: {e}")
             print("No update performed. Exiting with code 0.")
             return
@@ -346,7 +387,6 @@ def main():
         COL_NAME: TARGET_PROCEDURE_NAME,
         **metrics,
     }
-
     snapshot = normalize_snapshot(snapshot)
 
     print("Snapshot:", snapshot)
@@ -358,7 +398,7 @@ def main():
 
     if len(updated) == len(existing):
         print("No changes; nothing to append.")
-        return  
+        return
 
     updated.to_csv(OUT_CSV, index=False)
     print(f"Saved -> {OUT_CSV} (rows: {len(existing)} -> {len(updated)})")
