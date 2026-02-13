@@ -57,7 +57,7 @@ jobs:
 
       # If something fails, upload debug folder so you can open last_response.html/bin
       - name: Upload debug artifacts (on failure)
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: isun-debug

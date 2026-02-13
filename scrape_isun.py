@@ -322,7 +322,16 @@ def extract_metrics_from_row(row: pd.Series) -> dict:
 
 def main():
     print("Fetching export…")
-    content = fetch_with_fallback(EXPORT_URL)
+    try:
+        content = fetch_with_fallback(EXPORT_URL)
+    except Exception as e:
+        msg = str(e).lower()
+        if SKIP_ON_BLOCK and ("anti-bot" in msg or "protected" in msg or "text/html" in msg or "captcha" in msg):
+            print(f"SKIP: blocked by anti-bot protection: {e}")
+            print("No update performed. Exiting with code 0.")
+            return
+        raise
+
 
     print("Parsing export…")
     df = read_table_from_export(content)
