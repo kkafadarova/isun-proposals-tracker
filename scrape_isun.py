@@ -346,7 +346,14 @@ def append_if_changed(existing: pd.DataFrame, new_row: dict) -> pd.DataFrame:
     if existing is None or existing.empty:
         return new_df
 
-    last = existing.iloc[-1]
+    # choose last snapshot by timestamp if present
+    if COL_TIMESTAMP in existing.columns:
+        tmp = existing.copy()
+        tmp[COL_TIMESTAMP] = pd.to_datetime(tmp[COL_TIMESTAMP], errors="coerce")
+        last = tmp.sort_values(COL_TIMESTAMP).iloc[-1]
+    else:
+        last = existing.iloc[-1]
+
     for c in METRIC_COLS:
         if c not in existing.columns:
             return pd.concat([existing, new_df], ignore_index=True)
