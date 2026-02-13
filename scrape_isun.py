@@ -357,10 +357,15 @@ def main():
     else:
         existing = pd.DataFrame()
 
-    updated = pd.concat([existing, pd.DataFrame([snapshot])], ignore_index=True)
-    updated.to_csv(OUT_CSV, index=False)
+existing = load_existing(OUT_CSV)
+updated = append_if_changed(existing, snapshot)
 
-    print(f"Saved -> {OUT_CSV}")
+if len(updated) == len(existing):
+    print("No changes; nothing to append.")
+    return
+
+updated.to_csv(OUT_CSV, index=False)
+print(f"Saved -> {OUT_CSV} (rows: {len(existing)} -> {len(updated)})")
 
 
 if __name__ == "__main__":
