@@ -1,10 +1,10 @@
 name: Track ISUN proposals (hourly)
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *"
-
+# on:
+#   workflow_dispatch:
+#   schedule:
+#     - cron: "0 * * * *"
+on: []
 permissions:
   contents: write
 
